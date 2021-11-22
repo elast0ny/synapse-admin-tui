@@ -1,13 +1,16 @@
 use std::ops::{AddAssign, SubAssign};
 
 use crossterm::event::{KeyCode, KeyEvent};
-use tui::{
-    style::{Modifier, Style},
-    text::Span,
-};
+use tui::{style::{Color, Modifier, Style}, text::Span};
 
-pub const EDITING_STR_FOOTER: &[&str] = &["[Esc] Restore", "[Enter] Save"];
-pub const EDITING_BOOL_FOOTER: &[&str] = &["[Esc] Stop editing", "[Enter] Toggle"];
+pub const EDITING_STR_INFO: &[&str] = &["[Esc] Restore", "[Enter] Save"];
+pub const EDITING_BOOL_INFO: &[&str] = &["[Esc] Stop editing", "[Enter] Toggle"];
+
+pub enum EvtResult {
+    Continue,
+    Stop,
+    Pass,
+}
 
 pub trait EditableWidget {
     /// Returns the contents of the widget as a string
@@ -15,30 +18,23 @@ pub trait EditableWidget {
     /// Returns the contents of the widget as spans
     fn as_spans(&self, is_editing: bool) -> Vec<Span>;
     /// Key events forwarded from the main loop when editing the widget
-    fn handle_event(&mut self, key: &KeyEvent) -> Option<bool> {
-        default_handle_event(key)
-    }
+    fn handle_event(&mut self, key: &KeyEvent) -> EvtResult;
     /// If the contents have been modified
     fn is_changed(&self) -> bool;
     /// Whether this widget can be edited
     fn is_editable(&self) -> bool;
     /// Returns footer information for when the widget is in edit mode
     fn editing_footer(&self) -> &[&str];
-}
 
-pub fn default_handle_event(key: &KeyEvent) -> Option<bool> {
-    match key.code {
-        // Swallow the exit key events and return "done_editing"
-        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => Some(false),
-        _ => None,
-    }
+    fn restore_orig(&mut self);
+    fn forget_orig(&mut self);
 }
 
 pub struct MutStr {
-    val: String,
-    orig: Option<String>,
+    pub val: String,
+    pub orig: Option<String>,
     /// This is a valid byte offset into `val`
-    cursor: usize,
+    pub cursor: usize,
 }
 
 pub enum Editable {
@@ -94,17 +90,15 @@ impl EditableWidget for Editable {
         if let Editable::Str(s) = self {
             // Return spans with the cursor position underlined
             let mut r = Vec::with_capacity(3);
-            let cursor_char = if s.cursor == s.val.len() {
-                " "
-            } else {
-                decode_char(s.val.as_bytes(), s.cursor)
-            };
             if s.cursor > 0 {
                 r.push(Span::raw(&s.val[..s.cursor]));
             }
-            r.push(Span::styled(cursor_char, underlined));
             if s.cursor < s.val.len() {
+                let cursor_char = decode_char(s.val.as_bytes(), s.cursor);
+                r.push(Span::styled(cursor_char, underlined));
                 r.push(Span::raw(&s.val[s.cursor + cursor_char.len()..]));
+            } else {
+                r.push(Span::styled("_", Style::default().fg(Color::DarkGray)));
             }
             r
         } else {
@@ -112,90 +106,75 @@ impl EditableWidget for Editable {
         }
     }
 
-    fn handle_event(&mut self, key: &KeyEvent) -> Option<bool> {
-        match self {
+    fn handle_event(&mut self, key: &KeyEvent) -> EvtResult {
+        let r = match self {
             Self::Bool(cur, orig) => {
                 if let KeyCode::Enter = key.code {
                     if orig.is_none() {
                         *orig = Some(*cur);
                     }
                     *cur = !*cur;
-                    return Some(true);
+                    EvtResult::Continue
+                } else {
+                    EvtResult::Pass
                 }
             }
-            Self::Str(s) => {
-                let handled = match key.code {
-                    KeyCode::Char(c) => {
+            Self::Str(s) => match key.code {
+                KeyCode::Char(c) => {
+                    if s.orig.is_none() {
+                        s.orig = Some(s.val.clone());
+                    }
+                    s.val.insert(s.cursor, c);
+                    s.cursor += c.len_utf8();
+                    EvtResult::Continue
+                }
+                KeyCode::Delete => {
+                    if s.cursor < s.val.len() {
                         if s.orig.is_none() {
                             s.orig = Some(s.val.clone());
                         }
-                        s.val.insert(s.cursor, c);
-                        s.cursor += c.len_utf8();
-                        Some(true)
+                        s.val.remove(s.cursor);
                     }
-                    KeyCode::Esc => {
-                        if let Some(v) = s.orig.take() {
-                            s.val = v;
-                            s.cursor = s.val.len();
-                        }
-                        Some(false)
-                    }
-                    KeyCode::Enter => Some(false),
-                    KeyCode::Delete => {
-                        if s.cursor == s.val.len() {
-                            Some(true)
-                        } else {
-                            if s.orig.is_none() {
-                                s.orig = Some(s.val.clone());
-                            }
-                            s.val.remove(s.cursor);
-                            Some(true)
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        if s.cursor == 0 {
-                            Some(true)
-                        } else {
-                            if s.orig.is_none() {
-                                s.orig = Some(s.val.clone());
-                            }
-                            let mut prev_offset = 0;
-                            for c in s.val.char_indices() {
-                                if c.0 == s.cursor {
-                                    break;
-                                }
-                                prev_offset = c.0;
-                            }
-                            let c = s.val.remove(prev_offset);
-                            s.cursor -= c.len_utf8();
-                            Some(true)
-                        }
-                    }
-                    KeyCode::Left => {
-                        dec_val(&mut s.cursor, 1);
-                        Some(true)
-                    }
-                    KeyCode::Right => {
-                        inc_val(&mut s.cursor, 1, s.val.len() + 1);
-                        Some(true)
-                    }
-                    KeyCode::End => {
-                        s.cursor = s.val.len();
-                        Some(true)
-                    }
-                    KeyCode::Home => {
-                        s.cursor = 0;
-                        Some(true)
-                    }
-                    _ => None,
-                };
-                if handled.is_some() {
-                    return handled;
+                    EvtResult::Continue
                 }
-            }
-            _ => return None,
-        }
-        default_handle_event(key)
+                KeyCode::Backspace => {
+                    if s.cursor > 0 {
+                        if s.orig.is_none() {
+                            s.orig = Some(s.val.clone());
+                        }
+                        let mut prev_offset = 0;
+                        for c in s.val.char_indices() {
+                            if c.0 == s.cursor {
+                                break;
+                            }
+                            prev_offset = c.0;
+                        }
+                        let c = s.val.remove(prev_offset);
+                        s.cursor -= c.len_utf8();
+                    }
+                    EvtResult::Continue
+                }
+                KeyCode::Left => {
+                    dec_val(&mut s.cursor, 1);
+                    EvtResult::Continue
+                }
+                KeyCode::Right => {
+                    inc_val(&mut s.cursor, 1, s.val.len() + 1);
+                    EvtResult::Continue
+                }
+                KeyCode::End => {
+                    s.cursor = s.val.len();
+                    EvtResult::Continue
+                }
+                KeyCode::Home => {
+                    s.cursor = 0;
+                    EvtResult::Continue
+                }
+                _ => EvtResult::Pass,
+            },
+            _ => EvtResult::Pass,
+        };
+        r
     }
     fn is_changed(&self) -> bool {
         match self {
@@ -223,9 +202,37 @@ impl EditableWidget for Editable {
 
     fn editing_footer(&self) -> &[&str] {
         match self {
-            Self::Str(_) => EDITING_STR_FOOTER,
-            Self::Bool(..) => EDITING_BOOL_FOOTER,
+            Self::Str(_) => EDITING_STR_INFO,
+            Self::Bool(..) => EDITING_BOOL_INFO,
             _ => &[],
+        }
+    }
+
+    fn restore_orig(&mut self) {
+        match self {
+            Self::Str(s) => {
+                if let Some(v) = s.orig.take() {
+                    s.val = v;
+                    s.cursor = s.val.len();
+                }
+            }
+            Self::Bool(cur, orig) => {
+                if let Some(v) = orig.take() {
+                    *cur = v;
+                }
+            }
+            _ => {}
+        }
+    }
+    fn forget_orig(&mut self) {
+        match self {
+            Self::Str(s) => {
+                s.orig.take();
+            }
+            Self::Bool(_cur, orig) => {
+                orig.take();
+            }
+            _ => {}
         }
     }
 }
@@ -248,6 +255,14 @@ pub fn dec_val(orig: &mut usize, amount: usize) {
         *orig = 0;
     } else {
         orig.sub_assign(amount);
+    }
+}
+
+pub fn apply_offset(orig: &mut usize, offset: isize, max: usize) {
+    if offset > 0 {
+        inc_val(orig, offset.abs() as usize, max)
+    } else if offset < 0 {
+        dec_val(orig, offset.abs() as usize)
     }
 }
 

@@ -7,7 +7,8 @@ A terminal admin panel for [synapse](https://github.com/matrix-org/synapse/) ([\
   - ~~String~~
   - ~~bool~~
   - Numbers
-- command line argument parsing (take in target server URL, etc...)
-- Login page requesting the `access_token`
-- Load the synapse admin API spec into Rust structs
-- Implement sending HTTP requests based on the parse spec
+- ~~command line argument parsing (take in target server URL, etc...)~~
+- ~~Prompt user for `access_token`~~
+- ~~Validate `access_token`
+- ~~Download user list~~
+- Allow edits
