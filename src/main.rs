@@ -1,22 +1,20 @@
-use std::io::Stdout;
-
-use backend::*;
+use backend::Synapse;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent},
+    event::{self, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use editable::{Editable, EditableWidget};
+use state::State;
+use std::io::Stdout;
 use tui::{backend::CrosstermBackend, Terminal};
 
-mod state;
-use state::*;
-mod view;
-use view::*;
-mod backend;
-mod editable;
+pub mod common;
+use common::*;
 
-use crate::editable::EvtResult;
+pub mod backend;
+pub mod state;
+pub mod views;
+use views::*;
 
 use clap::Parser;
 
@@ -28,7 +26,7 @@ use clap::Parser;
 /// A terminal admin panel for synapse
 struct Args {
     /// The url that points to the synapse server (Default: http://127.0.0.1:8008)
-    #[clap(default_value="http://127.0.0.1:8008")]
+    #[clap(default_value = "http://127.0.0.1:8008")]
     host: String,
 
     /// Ignore invalid TLS certificates
@@ -52,53 +50,65 @@ fn raw_mode_main(args: Args, stdout: &mut Stdout) -> Result<(), Box<dyn std::err
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
 
-    let mut state = State::new(Backend::Synapse(Synapse::new(
-        args.host,
-        args.allow_invalid_certs,
-    )));
-    let mut view = View::Home;
+    let views: &mut [(bool, &mut dyn ViewImpl<State>)] = &mut [
+        (false, &mut HomeView::default()),
+        (false, &mut UsersView::default()),
+    ];
+    let backend = Synapse::new(args.host, args.allow_invalid_certs);
+    let state = &mut State::from_views(
+        views.iter_mut().map(|v| v.1 as &mut dyn ViewImpl<State>),
+        backend,
+    );
 
-    //let mut key_log = std::fs::OpenOptions::new().create(true).append(true).open("key.log")?;
+    let mut view_changed = true;
     loop {
-        state.check_backend_prompt(&mut view);
+        let (entered_once, cur_view): &mut (bool, &mut dyn ViewImpl<State>) =
+            &mut views[state.cur_tab()];
 
-        terminal.draw(|f| view.draw(&mut state, f))?;
-
-        if let Event::Key(key) = event::read()? {
-            //key_log.write_fmt(format_args!("{:?} {:?}\n", key.code, key.modifiers))?;
-
-            let (edit_widget, handler_fn): (
-                Option<&mut Editable>,
-                fn(&mut State, &mut View, &KeyEvent) -> EvtResult,
-            ) = match &view {
-                View::Prompt => (state.prompt.cur_field(), handle_event_prompt),
-                View::Home => (None, handle_event_passthrough),
-                View::UserList => (state.user_state.editing_item(), handle_event_users),
-            };
-
-            // Let the widget handle the keystroke
-            if let Some(w) = edit_widget {
-                if matches!(w.handle_event(&key), EvtResult::Continue | EvtResult::Stop) {
-                    continue;
+        // Call the draw impl
+        if view_changed {
+            terminal.draw(|f| {
+                // If main layout has an empty content
+                if let Some(content_rect) = state.draw_base(f, f.size()) {
+                    if !*entered_once {
+                        cur_view.enter_view(state);
+                        *entered_once = true;
+                    }
+                    // Forward the draw call to the current view
+                    cur_view.draw_view(f, content_rect, state);
                 }
-            }
+            })?;
+        }
 
-            // See if the current view wants to handle this event
-            match handler_fn(&mut state, &mut view, &key) {
-                EvtResult::Continue => continue,
-                EvtResult::Stop => return Ok(()),
-                EvtResult::Pass => {}
-            };
+        // Wait for something to happen
+        let evt = event::read()?;
+        if let Event::Resize(..) = evt {
+            view_changed = true;
+            continue;
+        }
 
-            // Fallback to generic impl
-            match key.code {
-                // Common behavior across all views
-                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return Ok(()),
-                KeyCode::Tab => state.next_view(&mut view),
-                KeyCode::BackTab => state.prev_view(&mut view),
-                KeyCode::F(1) => state.toggle_help(),
-                _ => {}
-            };
+        // Handle any core key else
+        let r = state.handle_event_pre(&evt);
+        view_changed = matches!(r, HandleRes::ReDraw);
+        if view_changed || matches!(r, HandleRes::Handled) {
+            continue;
+        } else if matches!(r, HandleRes::Exit(_)) {
+            break;
+        }
+
+        // Forward anything else to the view
+        let r = cur_view.handle_event(&evt, state);
+        view_changed = matches!(r, HandleRes::ReDraw);
+        if view_changed || matches!(r, HandleRes::Handled) {
+            continue;
+        } else if matches!(r, HandleRes::Exit(_)) {
+            break;
+        }
+
+        if matches!(state.handle_event_last(&evt), HandleRes::Exit(_)) {
+            break;
         }
     }
+
+    Ok(())
 }
